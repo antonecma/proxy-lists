@@ -8,333 +8,347 @@ var net = require('net');
 
 // Prepare the GeoIp data so that we can perform GeoIp look-ups later.
 GeoIpNativeLite.loadDataSync({
-	ipv4: true,
-	ipv6: false,
-	cache: true
+    ipv4: true,
+    ipv6: false,
+    cache: true
 });
 
 var ProxyLists = module.exports = {
 
-	defaultOptions: {
+    defaultOptions: {
 		/*
-			Get proxies for the specified countries.
+		 Get proxies for the specified countries.
 
-			To get all proxies, regardless of country, set this option to NULL.
+		 To get all proxies, regardless of country, set this option to NULL.
 
-			See:
-			https://en.wikipedia.org/wiki/ISO_3166-1
+		 See:
+		 https://en.wikipedia.org/wiki/ISO_3166-1
 
-			Only USA and Canada:
-			['us', 'ca']
-		*/
-		countries: null,
-
-		/*
-			Get proxies that use the specified protocols.
-
-			To get all proxies, regardless of protocol, set this option to NULL.
-		*/
-		protocols: ['http', 'https'],
+		 Only USA and Canada:
+		 ['us', 'ca']
+		 */
+        countries: null,
 
 		/*
-			Anonymity level.
+		 Get proxies that use the specified protocols.
 
-			To get all proxies, regardless of anonymity level, set this option to NULL.
-		*/
-		anonymityLevels: ['anonymous', 'elite'],
-
-		/*
-			Include proxy sources by name.
-
-			Only 'freeproxylists':
-			['freeproxylists']
-		*/
-		sourcesWhiteList: null,
+		 To get all proxies, regardless of protocol, set this option to NULL.
+		 */
+        protocols: ['http', 'https'],
 
 		/*
-			Exclude proxy sources by name.
+		 Anonymity level.
 
-			All proxy sources except 'freeproxylists':
-			['freeproxylists']
-		*/
-		sourcesBlackList: null,
+		 To get all proxies, regardless of anonymity level, set this option to NULL.
+		 */
+        anonymityLevels: ['anonymous', 'elite'],
 
 		/*
-			Set to TRUE to have all asynchronous operations run in series.
-		*/
-		series: false
-	},
+		 Include proxy sources by name.
+
+		 Only 'freeproxylists':
+		 ['freeproxylists']
+		 */
+        sourcesWhiteList: null,
+
+		/*
+		 Exclude proxy sources by name.
+
+		 All proxy sources except 'freeproxylists':
+		 ['freeproxylists']
+		 */
+        sourcesBlackList: null,
+
+		/*
+		 Set to TRUE to have all asynchronous operations run in series.
+		 */
+        series: false
+    },
+
+    _protocols: ['http', 'https', 'socks4', 'socks5'],
+    _anonymityLevels: ['transparent', 'anonymous', 'elite'],
+    _countries: require('./countries'),
+    _sources: require('./sources'),
+
+    // Get proxies from all sources.
+    getProxies: function(options) {
+
+        options = this.prepareOptions(options || {});
+
+        var emitter = new EventEmitter();
+        var sources = this.listSources(options);
+        var asyncMethod = options.series === true ? 'eachSeries' : 'each';
+        var onData = _.bind(emitter.emit, emitter, 'data');
+        var onError = _.bind(emitter.emit, emitter, 'error');
+        var onEnd = _.once(_.bind(emitter.emit, emitter, 'end'));
+
+        async[asyncMethod](sources, _.bind(function(source, next) {
+
+            try {
+                var gettingProxies = this.getProxiesFromSource(source.name, options);
+            } catch (error) {
+                // Print the error as a warning, but continue getting proxies.
+                console.warn(error.toString());
+                return next();
+            }
 
-	_protocols: ['http', 'https', 'socks4', 'socks5'],
-	_anonymityLevels: ['transparent', 'anonymous', 'elite'],
-	_countries: require('./countries'),
-	_sources: require('./sources'),
+            gettingProxies.on('data', onData);
+            gettingProxies.on('error', onError);
+            gettingProxies.on('end', _.once(_.bind(next, undefined, null)));
 
-	// Get proxies from all sources.
-	getProxies: function(options) {
+        }, this), onEnd);
 
-		options = this.prepareOptions(options || {});
+        return emitter;
+    },
 
-		var emitter = new EventEmitter();
-		var sources = this.listSources(options);
-		var asyncMethod = options.series === true ? 'eachSeries' : 'each';
-		var onData = _.bind(emitter.emit, emitter, 'data');
-		var onError = _.bind(emitter.emit, emitter, 'error');
-		var onEnd = _.once(_.bind(emitter.emit, emitter, 'end'));
+    // Get proxies from a single source.
+    getProxiesFromSource: function(name, options) {
 
-		async[asyncMethod](sources, _.bind(function(source, next) {
+        if (!this.sourceExists(name)) {
+            throw new Error('Proxy source does not exist: "' + name + '"');
+        }
 
-			try {
-				var gettingProxies = this.getProxiesFromSource(source.name, options);
-			} catch (error) {
-				// Print the error as a warning, but continue getting proxies.
-				console.warn(error.toString());
-				return next();
-			}
+        options = this.prepareOptions(options || {});
 
-			gettingProxies.on('data', onData);
-			gettingProxies.on('error', onError);
-			gettingProxies.on('end', _.once(_.bind(next, undefined, null)));
+        var source = this._sources[name];
 
-		}, this), onEnd);
+        if (source.requiredOptions) {
+            _.each(source.requiredOptions, function(message, key) {
+                if (!options[name] || !_.isObject(options[name]) || !options[name][key]) {
+                    throw new Error('Missing required option (`option.' + name + '.' + key + '`): ' + message);
+                }
+            });
+        }
 
-		return emitter;
-	},
+        var emitter = new EventEmitter();
+        var gettingProxies = source.getProxies(options);
 
-	// Get proxies from a single source.
-	getProxiesFromSource: function(name, options) {
+        gettingProxies.on('data', function(proxies) {
 
-		if (!this.sourceExists(name)) {
-			throw new Error('Proxy source does not exist: "' + name + '"');
-		}
+            proxies || (proxies = []);
 
-		options = this.prepareOptions(options || {});
+            proxies = proxies.filter(function(proxy) {
+                try {
+                    GeoIpNativeLite.lookup(proxy.ipAddress);
+                } catch (error){
+                    var errorMessage = error.message;
+                    console.log(errorMessage);
+                    if (errorMessage === 'Data (ipv6) has not been loaded.') {
+                        return false;
+                    } else {
+                        return true;
+                    }
+                }
+                return true;
+            });
+            // Add the 'source' attribute to every proxy.
+            proxies = _.map(proxies, function(proxy) {
+                proxy.source = name;
+                proxy.country = GeoIpNativeLite.lookup(proxy.ipAddress);
+                return proxy;
+            });
 
-		var source = this._sources[name];
+            proxies = ProxyLists.filterProxies(proxies, options);
 
-		if (source.requiredOptions) {
-			_.each(source.requiredOptions, function(message, key) {
-				if (!options[name] || !_.isObject(options[name]) || !options[name][key]) {
-					throw new Error('Missing required option (`option.' + name + '.' + key + '`): ' + message);
-				}
-			});
-		}
+            emitter.emit('data', proxies);
+        });
 
-		var emitter = new EventEmitter();
-		var gettingProxies = source.getProxies(options);
+        gettingProxies.on('error', _.bind(emitter.emit, emitter, 'error'));
+        gettingProxies.once('end', _.bind(emitter.emit, emitter, 'end'));
 
-		gettingProxies.on('data', function(proxies) {
+        return emitter;
+    },
 
-			proxies || (proxies = []);
+    addSource: function(name, source) {
 
-			// Add the 'source' attribute to every proxy.
-			proxies = _.map(proxies, function(proxy) {
-				proxy.source = name;
-				proxy.country = GeoIpNativeLite.lookup(proxy.ipAddress);
-				return proxy;
-			});
+        if (!_.isString(name) || name.length === 0) {
+            throw new Error('Invalid source name.');
+        }
 
-			proxies = ProxyLists.filterProxies(proxies, options);
+        if (this.sourceExists(name)) {
+            throw new Error('Source already exists: "' + name + '"');
+        }
 
-			emitter.emit('data', proxies);
-		});
+        if (!_.isObject(source) || _.isNull(source)) {
+            throw new Error('Expected "source" to be an object.');
+        }
 
-		gettingProxies.on('error', _.bind(emitter.emit, emitter, 'error'));
-		gettingProxies.once('end', _.bind(emitter.emit, emitter, 'end'));
+        if (!_.isFunction(source.getProxies)) {
+            throw new Error('Source missing required "getProxies" method.');
+        }
 
-		return emitter;
-	},
+        this._sources[name] = source;
+    },
 
-	addSource: function(name, source) {
+    sourceExists: function(name) {
 
-		if (!_.isString(name) || name.length === 0) {
-			throw new Error('Invalid source name.');
-		}
+        return _.has(this._sources, name);
+    },
 
-		if (this.sourceExists(name)) {
-			throw new Error('Source already exists: "' + name + '"');
-		}
+    listSources: function(options) {
 
-		if (!_.isObject(source) || _.isNull(source)) {
-			throw new Error('Expected "source" to be an object.');
-		}
+        options || (options = {});
 
-		if (!_.isFunction(source.getProxies)) {
-			throw new Error('Source missing required "getProxies" method.');
-		}
+        var sourcesWhiteList = options.sourcesWhiteList && arrayToHash(options.sourcesWhiteList);
+        var sourcesBlackList = options.sourcesBlackList && arrayToHash(options.sourcesBlackList);
 
-		this._sources[name] = source;
-	},
+        // Get an array of source names filtered by the options.
+        var sourceNames = _.filter(_.keys(this._sources), function(name) {
 
-	sourceExists: function(name) {
+            if (sourcesWhiteList) {
+                return sourcesWhiteList[name];
+            }
 
-		return _.has(this._sources, name);
-	},
+            if (sourcesBlackList) {
+                return !sourcesBlackList[name];
+            }
 
-	listSources: function(options) {
+            return true;
+        });
 
-		options || (options = {});
+        return _.map(sourceNames, function(name) {
 
-		var sourcesWhiteList = options.sourcesWhiteList && arrayToHash(options.sourcesWhiteList);
-		var sourcesBlackList = options.sourcesBlackList && arrayToHash(options.sourcesBlackList);
+            var source = this._sources[name];
 
-		// Get an array of source names filtered by the options.
-		var sourceNames = _.filter(_.keys(this._sources), function(name) {
+            return {
+                name: name,
+                homeUrl: source.homeUrl || '',
+                requiredOptions: source.requiredOptions || {}
+            };
 
-			if (sourcesWhiteList) {
-				return sourcesWhiteList[name];
-			}
+        }, this);
+    },
 
-			if (sourcesBlackList) {
-				return !sourcesBlackList[name];
-			}
+    filterProxies: function(proxies, options) {
 
-			return true;
-		});
+        options || (options = {});
 
-		return _.map(sourceNames, function(name) {
+        var countriesTest;
+        var protocolsTest;
+        var anonymityLevelsTest;
 
-			var source = this._sources[name];
+        if (options.countries) {
 
-			return {
-				name: name,
-				homeUrl: source.homeUrl || '',
-				requiredOptions: source.requiredOptions || {}
-			};
+            if (_.isArray(options.countries) || !_.isObject(options.countries)) {
+                throw new Error('Invalid option "countries": Object expected.');
+            }
 
-		}, this);
-	},
+            countriesTest = options.countries;
+        }
 
-	filterProxies: function(proxies, options) {
+        if (options.protocols) {
 
-		options || (options = {});
+            protocolsTest = arrayToHash(options.protocols);
+        }
 
-		var countriesTest;
-		var protocolsTest;
-		var anonymityLevelsTest;
+        if (options.anonymityLevels) {
 
-		if (options.countries) {
+            anonymityLevelsTest = arrayToHash(options.anonymityLevels);
+        }
 
-			if (_.isArray(options.countries) || !_.isObject(options.countries)) {
-				throw new Error('Invalid option "countries": Object expected.');
-			}
+        return _.filter(proxies, function(proxy) {
 
-			countriesTest = options.countries;
-		}
+            if (countriesTest && !countriesTest[proxy.country]) {
+                return false;
+            }
 
-		if (options.protocols) {
+            if (anonymityLevelsTest && !anonymityLevelsTest[proxy.anonymityLevel]) {
+                return false;
+            }
 
-			protocolsTest = arrayToHash(options.protocols);
-		}
+            if (protocolsTest) {
 
-		if (options.anonymityLevels) {
+                var hasAtLeastOnePassingProtocol = _.some(proxy.protocols, function(protocol) {
+                    return protocolsTest[protocol];
+                });
 
-			anonymityLevelsTest = arrayToHash(options.anonymityLevels);
-		}
+                if (!hasAtLeastOnePassingProtocol) {
+                    return false;
+                }
+            }
 
-		return _.filter(proxies, function(proxy) {
+            return true;
+        });
+    },
 
-			if (countriesTest && !countriesTest[proxy.country]) {
-				return false;
-			}
+    prepareOptions: function(options) {
 
-			if (anonymityLevelsTest && !anonymityLevelsTest[proxy.anonymityLevel]) {
-				return false;
-			}
+        options = _.extend({}, this.defaultOptions, options || {});
 
-			if (protocolsTest) {
+        if (_.isNull(options.countries)) {
+            // Use all countries.
+            options.countries = _.keys(this._countries);
+        }
 
-				var hasAtLeastOnePassingProtocol = _.some(proxy.protocols, function(protocol) {
-					return protocolsTest[protocol];
-				});
+        if (_.isNull(options.protocols)) {
+            // Use all protocols.
+            options.protocols = _.values(this._protocols);
+        }
 
-				if (!hasAtLeastOnePassingProtocol) {
-					return false;
-				}
-			}
+        if (_.isNull(options.anonymityLevels)) {
+            // Use all anonymity levels.
+            options.anonymityLevels = _.values(this._anonymityLevels);
+        }
 
-			return true;
-		});
-	},
+        if (!_.isArray(options.countries) && !_.isObject(options.countries)) {
+            throw new Error('Invalid option "countries": Array or object expected.');
+        }
 
-	prepareOptions: function(options) {
+        if (!_.isArray(options.protocols)) {
+            throw new Error('Invalid option "protocols": Array expected.');
+        }
 
-		options = _.extend({}, this.defaultOptions, options || {});
+        if (!_.isArray(options.anonymityLevels)) {
+            throw new Error('Invalid option "anonymityLevels": Array expected.');
+        }
 
-		if (_.isNull(options.countries)) {
-			// Use all countries.
-			options.countries = _.keys(this._countries);
-		}
+        if (options.countries && _.isArray(options.countries)) {
 
-		if (_.isNull(options.protocols)) {
-			// Use all protocols.
-			options.protocols = _.values(this._protocols);
-		}
+            options.countries = _.object(_.map(options.countries, function(code) {
+                return [code, this._countries[code]];
+            }, this));
+        }
 
-		if (_.isNull(options.anonymityLevels)) {
-			// Use all anonymity levels.
-			options.anonymityLevels = _.values(this._anonymityLevels);
-		}
+        return options;
+    },
 
-		if (!_.isArray(options.countries) && !_.isObject(options.countries)) {
-			throw new Error('Invalid option "countries": Array or object expected.');
-		}
+    isValidProxy: function(proxy, options) {
 
-		if (!_.isArray(options.protocols)) {
-			throw new Error('Invalid option "protocols": Array expected.');
-		}
+        options = _.defaults(options || {}, {
+            validateIp: true
+        });
 
-		if (!_.isArray(options.anonymityLevels)) {
-			throw new Error('Invalid option "anonymityLevels": Array expected.');
-		}
+        return !!proxy.ipAddress && (!options.validateIp || this.isValidIpAddress(proxy.ipAddress)) &&
+            !!proxy.port && this.isValidPort(proxy.port) &&
+            !!proxy.protocols && this.isValidProxyProtocols(proxy.protocols);
+    },
 
-		if (options.countries && _.isArray(options.countries)) {
+    isValidPort: function(port) {
 
-			options.countries = _.object(_.map(options.countries, function(code) {
-				return [code, this._countries[code]];
-			}, this));
-		}
+        return _.isNumber(port) && parseInt(port).toString() === port.toString();
+    },
 
-		return options;
-	},
+    isValidProxyProtocols: function(protocols) {
 
-	isValidProxy: function(proxy, options) {
+        return _.isArray(protocols) && protocols.length > 0 && _.every(protocols, function(protocol) {
+                return ProxyLists.isValidProxyProtocol(protocol);
+            });
+    },
 
-		options = _.defaults(options || {}, {
-			validateIp: true
-		});
+    isValidProxyProtocol: function(protocol) {
 
-		return !!proxy.ipAddress && (!options.validateIp || this.isValidIpAddress(proxy.ipAddress)) &&
-				!!proxy.port && this.isValidPort(proxy.port) &&
-				!!proxy.protocols && this.isValidProxyProtocols(proxy.protocols);
-	},
+        return _.contains(this._protocols, protocol);
+    },
 
-	isValidPort: function(port) {
+    isValidIpAddress: function(ipAddress) {
 
-		return _.isNumber(port) && parseInt(port).toString() === port.toString();
-	},
-
-	isValidProxyProtocols: function(protocols) {
-
-		return _.isArray(protocols) && protocols.length > 0 && _.every(protocols, function(protocol) {
-			return ProxyLists.isValidProxyProtocol(protocol);
-		});
-	},
-
-	isValidProxyProtocol: function(protocol) {
-
-		return _.contains(this._protocols, protocol);
-	},
-
-	isValidIpAddress: function(ipAddress) {
-
-		return net.isIP(ipAddress) !== 0;
-	}
+        return net.isIP(ipAddress) !== 0;
+    }
 };
 
 var arrayToHash = function(array) {
 
-	return _.object(_.map(array, function(value) {
-		return [value, true];
-	}));
+    return _.object(_.map(array, function(value) {
+        return [value, true];
+    }));
 };
